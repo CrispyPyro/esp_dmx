@@ -10,7 +10,7 @@ struct dmx_gpio_t {
 } dmx_gpio_context[DMX_NUM_MAX] = {
     {-1},
     {-1},
-#if DMX_NUM_MAX > 2
+#if SOC_UART_NUM > 2
     {-1},
 #endif
 };

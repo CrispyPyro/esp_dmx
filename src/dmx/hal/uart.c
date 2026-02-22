@@ -31,7 +31,7 @@ static struct dmx_uart_t {
 } dmx_uart_context[DMX_NUM_MAX] = {
     {.num = 0, .dev = UART_LL_GET_HW(0)},
     {.num = 1, .dev = UART_LL_GET_HW(1)},
-#if DMX_NUM_MAX > 2
+#if SOC_UART_NUM > 2
     {.num = 2, .dev = UART_LL_GET_HW(2)},
 #endif
 };
@@ -347,11 +347,24 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
 bool dmx_uart_init(dmx_port_t dmx_num, void *isr_context, int isr_flags) {
   struct dmx_uart_t *uart = &dmx_uart_context[dmx_num];
 
+  // Sanity-check that this build/target actually has the requested UART.
+  // NOTE: We avoid DMX_CHECK here so we can include richer context in logs.
+  if (!(uart->num >= 0 && uart->num < SOC_UART_NUM)) {
+    DMX_ERR("dmx_uart_init: invalid uart num (dmx_num=%u uart_num=%i)",
+            (unsigned)dmx_num, uart->num);
+    return false;
+  }
+  if (uart->dev == NULL) {
+    DMX_ERR("dmx_uart_init: uart dev is null (dmx_num=%u uart_num=%i dev=%p)",
+            (unsigned)dmx_num, uart->num, (void *)uart->dev);
+    return false;
+  }
+
   // Enable and reset the correct UART peripheral module
   periph_module_t uart_module = dmx_uart_module_for_num(uart->num);
   periph_module_enable(uart_module);
 
-  if (dmx_num != 0) {  // Default UART port for console is 0
+  if (uart->num != 0) {  // Default UART port for console is 0
   #if SOC_UART_REQUIRE_CORE_RESET
     // ESP32-C3 (and others) workaround to prevent garbage on UART
     uart_ll_set_reset_core(uart->dev, true);
@@ -366,7 +379,7 @@ bool dmx_uart_init(dmx_port_t dmx_num, void *isr_context, int isr_flags) {
   // IDF 5.x+: use the native UART config where possible
   #if CONFIG_IDF_TARGET_ESP32C6
     // UART2 on C6 is an LP UART; select LP_FAST for it
-    if (dmx_num == 2) {
+    if (uart->num == 2) {
       LP_CLKRST.lpperi.lp_uart_clk_sel = 0;  // Use LP_UART_SCLK_LP_FAST
     }
   #endif
@@ -397,18 +410,23 @@ bool dmx_uart_init(dmx_port_t dmx_num, void *isr_context, int isr_flags) {
   uart_ll_set_tx_idle_num(uart->dev, 0);
   uart_ll_set_txfifo_empty_thr(uart->dev, DMX_UART_EMPTY_DEFAULT);
   uart_ll_set_rxfifo_full_thr(uart->dev, DMX_UART_FULL_DEFAULT);
-  uart_ll_tx_break(uart->dev, 0);
-  uart_ll_set_tx_idle_num(uart->dev, 0);
-  uart_ll_set_txfifo_empty_thr(uart->dev, DMX_UART_EMPTY_DEFAULT);
-  uart_ll_set_rxfifo_full_thr(uart->dev, DMX_UART_FULL_DEFAULT);
 
   dmx_uart_rxfifo_reset(dmx_num);
   dmx_uart_txfifo_reset(dmx_num);
   dmx_uart_disable_interrupt(dmx_num, UART_LL_INTR_MASK);
   dmx_uart_clear_interrupt(dmx_num, UART_LL_INTR_MASK);
 
-  esp_intr_alloc(uart_periph_signal[dmx_num].irq, isr_flags, dmx_uart_isr,
-                 isr_context, &uart->isr_handle);
+  // IMPORTANT: index uart_periph_signal[] by the UART peripheral number,
+  // not the DMX port number. On some builds these can diverge, causing the ISR
+  // to be allocated on the wrong interrupt source.
+  esp_err_t intr_err = esp_intr_alloc(uart_periph_signal[uart->num].irq,
+                                      isr_flags, dmx_uart_isr, isr_context,
+                                      &uart->isr_handle);
+  if (intr_err != ESP_OK) {
+    DMX_ERR("dmx_uart_init: esp_intr_alloc failed (dmx_num=%u uart_num=%i err=%i)",
+            (unsigned)dmx_num, uart->num, (int)intr_err);
+    return false;
+  }
 
   return true;
 }
