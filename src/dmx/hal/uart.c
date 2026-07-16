@@ -426,6 +426,17 @@ bool dmx_uart_init(dmx_port_t dmx_num, void *isr_context, int isr_flags) {
   dmx_uart_disable_interrupt(dmx_num, UART_LL_INTR_MASK);
   dmx_uart_clear_interrupt(dmx_num, UART_LL_INTR_MASK);
 
+  // IMPORTANT: free any ISR handle left over from a previous install before
+  // allocating a new one. Interrupt inputs are a scarce per-core resource;
+  // leaking one per install/uninstall cycle exhausts the pool after a handful
+  // of driver restarts and every subsequent install fails with
+  // "No free interrupt inputs" (observed on S3 with the RX silent-stall
+  // watchdog restarting the driver while no console is connected).
+  if (uart->isr_handle != NULL) {
+    esp_intr_free(uart->isr_handle);
+    uart->isr_handle = NULL;
+  }
+
   // IMPORTANT: index uart_periph_signal[] by the UART peripheral number,
   // not the DMX port number. On some builds these can diverge, causing the ISR
   // to be allocated on the wrong interrupt source.
@@ -443,6 +454,14 @@ bool dmx_uart_init(dmx_port_t dmx_num, void *isr_context, int isr_flags) {
 
 void dmx_uart_deinit(dmx_port_t dmx_num) {
   struct dmx_uart_t *uart = &dmx_uart_context[dmx_num];
+  // Release the ISR allocation made in dmx_uart_init(); without this every
+  // install/uninstall cycle leaks one interrupt input until esp_intr_alloc()
+  // fails and the driver can never be reinstalled. esp_intr_free() is safe
+  // from any core: it dispatches to the allocating core internally.
+  if (uart->isr_handle != NULL) {
+    esp_intr_free(uart->isr_handle);
+    uart->isr_handle = NULL;
+  }
   if (uart->num != 0) {  // Default UART port for console is 0
     periph_module_disable(dmx_uart_module_for_num(uart->num));
   }
