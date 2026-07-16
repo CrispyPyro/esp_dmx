@@ -309,6 +309,43 @@ size_t dmx_receive(dmx_port_t dmx_num, dmx_packet_t *packet,
                    TickType_t wait_ticks);
 
 /**
+ * @brief Receives a DMX packet and atomically copies a prefix of that same
+ * packet into a destination buffer.
+ *
+ * Unlike a later dmx_read(), the copied prefix and returned packet metadata
+ * are retained together by the UART ISR before the live receive buffer can be
+ * reused for another frame. The requested snapshot size is bounded by
+ * DMX_PACKET_SIZE_MAX. Bytes beyond a short packet are cleared in the caller's
+ * destination. A completion that predates this call is discarded because it
+ * has no ISR-retained prefix; the function waits for the next completion.
+ *
+ * @param dmx_num The DMX port number.
+ * @param[out] packet Optional metadata for the retained packet.
+ * @param[out] destination Buffer that receives the retained packet prefix.
+ * @param snapshot_size Number of prefix bytes to copy, including start code.
+ * @param wait_ticks Number of ticks to wait before timeout.
+ * @return The retained packet size, or 0 if no packet was retained.
+ */
+size_t dmx_receive_snapshot(dmx_port_t dmx_num, dmx_packet_t *packet,
+                            void *destination, size_t snapshot_size,
+                            TickType_t wait_ticks);
+
+#ifdef PIO_UNIT_TESTING
+/**
+ * @brief Test-only deterministic exercise of RX snapshot retention.
+ *
+ * Commits first_packet, attempts to commit second_packet before consumption,
+ * then returns the retained first prefix and metadata. This function does not
+ * install or access UART hardware.
+ */
+size_t dmx_test_rx_snapshot_retention(
+    const uint8_t *first_packet, size_t first_packet_size,
+    dmx_err_t first_packet_err, const uint8_t *second_packet,
+    size_t second_packet_size, void *destination, size_t snapshot_size,
+    dmx_packet_t *packet);
+#endif
+
+/**
  * @brief Sends a DMX packet on the DMX bus. This function blocks until the DMX
  * driver is idle and then sends a packet.
  *

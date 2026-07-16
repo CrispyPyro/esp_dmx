@@ -114,35 +114,49 @@ int dmx_write_slot(dmx_port_t dmx_num, size_t slot_num, uint8_t value) {
   return value;
 }
 
-size_t dmx_receive_num(dmx_port_t dmx_num, dmx_packet_t *packet, size_t size,
-                       TickType_t wait_ticks) {
+static void dmx_set_timeout_packet(dmx_packet_t *packet) {
+  if (packet != NULL) {
+    packet->err = DMX_ERR_TIMEOUT;
+    packet->sc = -1;
+    packet->size = 0;
+    packet->is_rdm = 0;
+  }
+}
+
+static void dmx_cancel_rx_snapshot_locked(dmx_driver_t *driver) {
+  driver->rx_snapshot.request_active = false;
+  driver->rx_snapshot.pending = false;
+  driver->rx_snapshot.requested_size = 0;
+  driver->rx_snapshot.copied_size = 0;
+}
+
+static size_t dmx_receive_num_internal(dmx_port_t dmx_num,
+                                       dmx_packet_t *packet, size_t size,
+                                       void *snapshot_destination,
+                                       size_t snapshot_size,
+                                       TickType_t wait_ticks) {
   DMX_CHECK(dmx_num < DMX_NUM_MAX, 0, "dmx_num error");
   DMX_CHECK(dmx_driver_is_installed(dmx_num), 0, "driver is not installed");
   DMX_CHECK(dmx_driver_is_enabled(dmx_num), 0, "driver is not enabled");
+  DMX_CHECK(snapshot_size <= DMX_PACKET_SIZE_MAX, 0,
+            "snapshot_size error");
+  DMX_CHECK(snapshot_size == 0 || snapshot_destination != NULL, 0,
+            "snapshot destination is null");
 
   dmx_driver_t *const driver = dmx_driver[dmx_num];
+  const bool snapshot_requested = snapshot_size > 0;
 
   // Block until mutex is taken and driver is idle, or until a timeout
   TimeOut_t timeout;
   vTaskSetTimeOutState(&timeout);
   if (!xSemaphoreTakeRecursive(driver->mux, wait_ticks) ||
       (wait_ticks && xTaskCheckForTimeOut(&timeout, &wait_ticks))) {
-    if (packet != NULL) {
-      packet->err = DMX_ERR_TIMEOUT;
-      packet->sc = -1;
-      packet->size = 0;
-      packet->is_rdm = 0;
-    }
+    dmx_set_timeout_packet(packet);
     return 0;
   } else if (!dmx_wait_sent(dmx_num, wait_ticks) ||
              (wait_ticks && xTaskCheckForTimeOut(&timeout, &wait_ticks))) {
     xSemaphoreGiveRecursive(driver->mux);
-    if (packet != NULL) {
-      packet->err = DMX_ERR_TIMEOUT;
-      packet->sc = -1;
-      packet->size = 0;
-      packet->is_rdm = 0;
-    }
+    dmx_set_timeout_packet(packet);
     return 0;
   }
 
@@ -171,6 +185,12 @@ size_t dmx_receive_num(dmx_port_t dmx_num, dmx_packet_t *packet, size_t size,
     taskEXIT_CRITICAL(DMX_SPINLOCK(dmx_num));
   }
 
+  if (snapshot_requested) {
+    taskENTER_CRITICAL(DMX_SPINLOCK(dmx_num));
+    dmx_rx_snapshot_request_locked(driver, snapshot_size);
+    taskEXIT_CRITICAL(DMX_SPINLOCK(dmx_num));
+  }
+
   // Guard against condition where this task cannot block and data isn't ready
   int packet_status;
   int packet_size;
@@ -180,12 +200,12 @@ size_t dmx_receive_num(dmx_port_t dmx_num, dmx_packet_t *packet, size_t size,
   taskEXIT_CRITICAL(DMX_SPINLOCK(dmx_num));
   if (packet_status != DMX_PROGRESS_COMPLETE && wait_ticks == 0) {
     // Not enough DMX data has been received yet - return early
-    if (packet != NULL) {
-      packet->err = DMX_ERR_TIMEOUT;
-      packet->sc = -1;
-      packet->size = 0;
-      packet->is_rdm = 0;
+    if (snapshot_requested) {
+      taskENTER_CRITICAL(DMX_SPINLOCK(dmx_num));
+      dmx_cancel_rx_snapshot_locked(driver);
+      taskEXIT_CRITICAL(DMX_SPINLOCK(dmx_num));
     }
+    dmx_set_timeout_packet(packet);
     xSemaphoreGiveRecursive(driver->mux);
     return 0;
   }
@@ -195,8 +215,17 @@ size_t dmx_receive_num(dmx_port_t dmx_num, dmx_packet_t *packet, size_t size,
   if (packet_status != DMX_PROGRESS_COMPLETE) {
     // Tell the DMX driver that this task is awaiting a DMX packet
     const TaskHandle_t current_task_handle = xTaskGetCurrentTaskHandle();
+    bool snapshot_already_retained = false;
     taskENTER_CRITICAL(DMX_SPINLOCK(dmx_num));
     driver->task_waiting = current_task_handle;
+    // Close the status-check/waiter-registration race for snapshot callers. A
+    // completion in that interval has already retained coherent data, but the
+    // ISR could not notify a waiter that was not registered yet.
+    if (snapshot_requested && driver->rx_snapshot.pending) {
+      err = driver->rx_snapshot.packet.err;
+      driver->task_waiting = NULL;
+      snapshot_already_retained = true;
+    }
     taskEXIT_CRITICAL(DMX_SPINLOCK(dmx_num));
 
     // Determine if it is necessary to set a hardware timeout alarm
@@ -208,7 +237,7 @@ size_t dmx_receive_num(dmx_port_t dmx_num, dmx_packet_t *packet, size_t size,
     }
 
     // Set an alarm to timeout early if an RDM response is expected
-    if (timer_alarm > 0) {
+    if (!snapshot_already_retained && timer_alarm > 0) {
       int64_t last_timestamp;
       taskENTER_CRITICAL(DMX_SPINLOCK(dmx_num));
       last_timestamp = driver->dmx.controller_eop_timestamp;
@@ -217,12 +246,13 @@ size_t dmx_receive_num(dmx_port_t dmx_num, dmx_packet_t *packet, size_t size,
           dmx_timer_get_micros_since_boot() - last_timestamp;
       if (timer_elapsed > timer_alarm) {
         // Return early if the time elapsed is greater than the timer alarm
-        if (packet != NULL) {
-          packet->err = DMX_ERR_TIMEOUT;
-          packet->sc = -1;
-          packet->size = 0;
-          packet->is_rdm = 0;
+        taskENTER_CRITICAL(DMX_SPINLOCK(dmx_num));
+        driver->task_waiting = NULL;
+        if (snapshot_requested) {
+          dmx_cancel_rx_snapshot_locked(driver);
         }
+        taskEXIT_CRITICAL(DMX_SPINLOCK(dmx_num));
+        dmx_set_timeout_packet(packet);
         xSemaphoreGiveRecursive(driver->mux);
         return 0;
       }
@@ -236,19 +266,22 @@ size_t dmx_receive_num(dmx_port_t dmx_num, dmx_packet_t *packet, size_t size,
     }
 
     // Wait for the DMX driver to notify this task that DMX is ready
-    const bool notified = xTaskNotifyWait(0, -1, (uint32_t *)&err, wait_ticks);
+    const bool notified = snapshot_already_retained ||
+                          xTaskNotifyWait(0, -1, (uint32_t *)&err, wait_ticks);
     taskENTER_CRITICAL(DMX_SPINLOCK(dmx_num));
     packet_size = driver->dmx.head;
-    driver->task_waiting = NULL;
+    if (!snapshot_already_retained) {
+      driver->task_waiting = NULL;
+    }
     taskEXIT_CRITICAL(DMX_SPINLOCK(dmx_num));
     if (!notified) {
       xTaskNotifyStateClear(current_task_handle);  // Avoid race condition
-      if (packet != NULL) {
-        packet->err = DMX_ERR_TIMEOUT;
-        packet->sc = -1;
-        packet->size = 0;
-        packet->is_rdm = 0;
+      if (snapshot_requested) {
+        taskENTER_CRITICAL(DMX_SPINLOCK(dmx_num));
+        dmx_cancel_rx_snapshot_locked(driver);
+        taskEXIT_CRITICAL(DMX_SPINLOCK(dmx_num));
       }
+      dmx_set_timeout_packet(packet);
       xSemaphoreGiveRecursive(driver->mux);
       dmx_parameter_commit(dmx_num);
       return 0;
@@ -261,7 +294,39 @@ size_t dmx_receive_num(dmx_port_t dmx_num, dmx_packet_t *packet, size_t size,
     packet_size = 0;
   }
 
-  // Parse DMX packet data
+  // Parse DMX packet data. Snapshot callers consume retained metadata/data
+  // committed by the ISR before the live receive buffer could be reused.
+  if (snapshot_requested) {
+    dmx_packet_t retained_packet;
+    bool retained = false;
+
+    taskENTER_CRITICAL(DMX_SPINLOCK(dmx_num));
+    driver->dmx.progress = DMX_PROGRESS_STALE;
+    if (driver->rx_snapshot.pending) {
+      retained_packet = driver->rx_snapshot.packet;
+      memset(snapshot_destination, 0, snapshot_size);
+      memcpy(snapshot_destination, driver->rx_snapshot.data,
+             driver->rx_snapshot.copied_size);
+      retained = true;
+    }
+    dmx_cancel_rx_snapshot_locked(driver);
+    taskEXIT_CRITICAL(DMX_SPINLOCK(dmx_num));
+
+    if (!retained) {
+      dmx_set_timeout_packet(packet);
+      xSemaphoreGiveRecursive(driver->mux);
+      return 0;
+    }
+    if (packet != NULL) {
+      *packet = retained_packet;
+    }
+    xSemaphoreGiveRecursive(driver->mux);
+    return retained_packet.size;
+  }
+
+  // Legacy metadata-only receive path. A later dmx_read() remains
+  // asynchronous by design; callers requiring coherence must use the snapshot
+  // API above.
   taskENTER_CRITICAL(DMX_SPINLOCK(dmx_num));
   driver->dmx.progress = DMX_PROGRESS_STALE;  // Prevent parsing old data
   taskEXIT_CRITICAL(DMX_SPINLOCK(dmx_num));
@@ -282,6 +347,11 @@ size_t dmx_receive_num(dmx_port_t dmx_num, dmx_packet_t *packet, size_t size,
   return packet_size;
 }
 
+size_t dmx_receive_num(dmx_port_t dmx_num, dmx_packet_t *packet, size_t size,
+                       TickType_t wait_ticks) {
+  return dmx_receive_num_internal(dmx_num, packet, size, NULL, 0, wait_ticks);
+}
+
 size_t dmx_receive(dmx_port_t dmx_num, dmx_packet_t *packet,
                    TickType_t wait_ticks) {
   DMX_CHECK(dmx_num < DMX_NUM_MAX, 0, "dmx_num error");
@@ -294,6 +364,22 @@ size_t dmx_receive(dmx_port_t dmx_num, dmx_packet_t *packet,
   taskEXIT_CRITICAL(DMX_SPINLOCK(dmx_num));
 
   return dmx_receive_num(dmx_num, packet, size, wait_ticks);
+}
+
+size_t dmx_receive_snapshot(dmx_port_t dmx_num, dmx_packet_t *packet,
+                            void *destination, size_t snapshot_size,
+                            TickType_t wait_ticks) {
+  DMX_CHECK(dmx_num < DMX_NUM_MAX, 0, "dmx_num error");
+  DMX_CHECK(dmx_driver_is_installed(dmx_num), 0, "driver is not installed");
+  DMX_CHECK(dmx_driver_is_enabled(dmx_num), 0, "driver is not enabled");
+
+  size_t size;
+  taskENTER_CRITICAL(DMX_SPINLOCK(dmx_num));
+  size = dmx_driver[dmx_num]->dmx.size;
+  taskEXIT_CRITICAL(DMX_SPINLOCK(dmx_num));
+
+  return dmx_receive_num_internal(dmx_num, packet, size, destination,
+                                  snapshot_size, wait_ticks);
 }
 
 size_t dmx_send_num(dmx_port_t dmx_num, size_t size) {

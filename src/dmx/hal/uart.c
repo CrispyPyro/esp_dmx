@@ -101,19 +101,25 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
 
       // Handle DMX break condition
       if (intr_flags & DMX_INTR_RX_BREAK) {
-        // Handle possible condition where expected packet size is too large
+        taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
+        // Handle possible condition where expected packet size is too large.
+        // Snapshot consumers must retain the short packet before head/data are
+        // reset for the frame whose break we just observed.
         if (driver->dmx.progress == DMX_PROGRESS_IN_DATA && dmx_head > 0) {
-          taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
-          driver->dmx.size = dmx_head - 1;  // Attempt to fix packet size
-          if (driver->task_waiting) {
+          const int short_packet_size = dmx_head - 1;
+          driver->dmx.size = short_packet_size;  // Attempt to fix packet size
+          const bool snapshot_captured = dmx_rx_snapshot_capture_locked(
+              driver, short_packet_size, DMX_ERR_NOT_ENOUGH_SLOTS);
+          const bool should_notify = !driver->rx_snapshot.request_active ||
+                                     snapshot_captured;
+          if (driver->task_waiting && should_notify) {
             xTaskNotifyFromISR(driver->task_waiting, DMX_ERR_NOT_ENOUGH_SLOTS,
                                eSetValueWithOverwrite, &task_awoken);
           }
-          taskEXIT_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
         }
 
-        // Reset the DMX buffer for the next packet
-        taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
+        // Reset the live DMX buffer for the next packet only after any
+        // requested short-frame snapshot is committed.
         driver->dmx.status = DMX_STATUS_RECEIVING;
         driver->dmx.progress = DMX_PROGRESS_IN_BREAK;
         driver->dmx.head = 0;
@@ -273,7 +279,11 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
       taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
       driver->dmx.progress = DMX_PROGRESS_COMPLETE;
       driver->dmx.status = DMX_STATUS_IDLE;  // Could still be receiving data
-      if (driver->task_waiting) {
+      const bool snapshot_captured =
+          dmx_rx_snapshot_capture_locked(driver, dmx_head, err);
+      const bool should_notify =
+          !driver->rx_snapshot.request_active || snapshot_captured;
+      if (driver->task_waiting && should_notify) {
         xTaskNotifyFromISR(driver->task_waiting, err, eSetValueWithOverwrite,
                            &task_awoken);
       }

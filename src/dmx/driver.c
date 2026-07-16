@@ -174,6 +174,17 @@ bool dmx_driver_install(dmx_port_t dmx_num, const dmx_config_t *config,
   driver->dmx.last_request_pid = 0;
   driver->dmx.last_request_pid_repeats = 0;
 
+  // Atomic receive-prefix snapshot state. The backing buffer is part of the
+  // driver allocation so the ISR never writes through a caller-owned pointer.
+  driver->rx_snapshot.request_active = false;
+  driver->rx_snapshot.pending = false;
+  driver->rx_snapshot.requested_size = 0;
+  driver->rx_snapshot.copied_size = 0;
+  driver->rx_snapshot.packet.err = DMX_ERR_TIMEOUT;
+  driver->rx_snapshot.packet.sc = -1;
+  driver->rx_snapshot.packet.size = 0;
+  driver->rx_snapshot.packet.is_rdm = false;
+
   // RDM responder configuration
   driver->rdm.tn = 0;
 

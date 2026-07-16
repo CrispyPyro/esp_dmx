@@ -145,6 +145,19 @@ typedef struct dmx_driver_t {
     };
   } dmx;
 
+  // Optional receive snapshot retained for dmx_receive*_snapshot(). The UART
+  // ISR commits the requested prefix and matching packet metadata before the
+  // live RX buffer can be reused for another frame. A pending snapshot is
+  // never overwritten before the waiting task consumes it.
+  struct dmx_driver_rx_snapshot_t {
+    bool request_active;
+    bool pending;
+    size_t requested_size;
+    size_t copied_size;
+    dmx_packet_t packet;
+    uint8_t data[DMX_PACKET_SIZE_MAX];
+  } rx_snapshot;
+
   // RDM driver information
   struct dmx_driver_rdm_t {
     union {
@@ -174,6 +187,27 @@ typedef struct dmx_driver_t {
 } dmx_driver_t;
 
 extern dmx_driver_t *dmx_driver[DMX_NUM_MAX];
+
+/**
+ * @brief Registers a receive snapshot request and discards stale completion.
+ *
+ * The caller must hold the driver's spinlock. A packet that completed before
+ * registration has no matching retained prefix and is marked stale so the
+ * request waits for the next ISR completion.
+ */
+void dmx_rx_snapshot_request_locked(dmx_driver_t *driver,
+                                    size_t snapshot_size);
+
+/**
+ * @brief Retains the current RX packet for a registered snapshot request.
+ *
+ * The caller must hold the driver's spinlock. This function is ISR-safe and
+ * returns true only when it commits a new snapshot. An already-pending
+ * snapshot is deliberately retained instead of being overwritten.
+ */
+bool DMX_ISR_ATTR dmx_rx_snapshot_capture_locked(dmx_driver_t *driver,
+                                                 int packet_size,
+                                                 dmx_err_t err);
 
 // TODO: implement dmx_device_add()
 // dmx_device_add(dmx_num, device_num);
