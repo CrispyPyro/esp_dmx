@@ -263,11 +263,13 @@ bool dmx_driver_delete(dmx_port_t dmx_num) {
 
   dmx_driver_t *const driver = dmx_driver[dmx_num];
 
-  // Take the mutex
-  if (!xSemaphoreTakeRecursive(driver->mux, 0)) {
+  // Take the mutex. The mutex is NULL only when dmx_driver_install() calls
+  // back into this function after its own mutex allocation failed; there is
+  // nothing to take in that case, and taking a NULL semaphore would assert.
+  SemaphoreHandle_t mux = driver->mux;
+  if (mux != NULL && !xSemaphoreTakeRecursive(mux, 0)) {
     return false;
   }
-  SemaphoreHandle_t mux = driver->mux;
 
   // Uninstall sniffer ISR
   if (dmx_sniffer_is_enabled(dmx_num)) {
@@ -289,7 +291,16 @@ bool dmx_driver_delete(dmx_port_t dmx_num) {
     for (int i = 0; i < param_count; ++i) {
       if (device->parameters[i].pid == 0) {
         break;  // No more parameters remaining
-      } else if (device->parameters[i].type != DMX_PARAMETER_TYPE_DYNAMIC) {
+      }
+      // Free every malloc-backed parameter type. NON_VOLATILE (and its staged
+      // variant) allocate in dmx_parameter_add() just like DYNAMIC; freeing
+      // only DYNAMIC leaked several small blocks per install/delete cycle,
+      // which compounds when a watchdog reinstalls the driver periodically.
+      // STATIC points at caller-owned memory and NULL has no data.
+      const int type = device->parameters[i].type;
+      if (type != DMX_PARAMETER_TYPE_DYNAMIC &&
+          type != DMX_PARAMETER_TYPE_NON_VOLATILE &&
+          type != DMX_PARAMETER_TYPE_NON_VOLATILE_STAGED) {
         continue;  // Nothing to free
       }
       free(device->parameters[i].data);
@@ -309,9 +320,11 @@ bool dmx_driver_delete(dmx_port_t dmx_num) {
   heap_caps_free(driver);
   dmx_driver[dmx_num] = NULL;
 
-  // Free driver mutex
-  xSemaphoreGiveRecursive(mux);
-  vSemaphoreDelete(mux);
+  // Free driver mutex (absent when install's mutex allocation failed)
+  if (mux != NULL) {
+    xSemaphoreGiveRecursive(mux);
+    vSemaphoreDelete(mux);
+  }
 
   return true;
 }

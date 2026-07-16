@@ -432,8 +432,17 @@ bool dmx_uart_init(dmx_port_t dmx_num, void *isr_context, int isr_flags) {
   // of driver restarts and every subsequent install fails with
   // "No free interrupt inputs" (observed on S3 with the RX silent-stall
   // watchdog restarting the driver while no console is connected).
+  // esp_intr_free() can fail (e.g. cross-core IPC failure); in that case the
+  // old interrupt is still allocated, so keep the handle for a later retry
+  // and abort this init rather than overwrite the only reference to it.
   if (uart->isr_handle != NULL) {
-    esp_intr_free(uart->isr_handle);
+    esp_err_t free_err = esp_intr_free(uart->isr_handle);
+    if (free_err != ESP_OK) {
+      DMX_ERR("dmx_uart_init: esp_intr_free of stale handle failed "
+              "(dmx_num=%u err=%i)",
+              (unsigned)dmx_num, (int)free_err);
+      return false;
+    }
     uart->isr_handle = NULL;
   }
 
@@ -457,10 +466,18 @@ void dmx_uart_deinit(dmx_port_t dmx_num) {
   // Release the ISR allocation made in dmx_uart_init(); without this every
   // install/uninstall cycle leaks one interrupt input until esp_intr_alloc()
   // fails and the driver can never be reinstalled. esp_intr_free() is safe
-  // from any core: it dispatches to the allocating core internally.
+  // from any core: it dispatches to the allocating core internally. If it
+  // fails (e.g. cross-core IPC failure) the interrupt is still allocated, so
+  // keep the handle: the next dmx_uart_init() retries the free instead of
+  // overwriting the only reference to the live allocation.
   if (uart->isr_handle != NULL) {
-    esp_intr_free(uart->isr_handle);
-    uart->isr_handle = NULL;
+    esp_err_t free_err = esp_intr_free(uart->isr_handle);
+    if (free_err == ESP_OK) {
+      uart->isr_handle = NULL;
+    } else {
+      DMX_ERR("dmx_uart_deinit: esp_intr_free failed (dmx_num=%u err=%i)",
+              (unsigned)dmx_num, (int)free_err);
+    }
   }
   if (uart->num != 0) {  // Default UART port for console is 0
     periph_module_disable(dmx_uart_module_for_num(uart->num));
