@@ -309,6 +309,27 @@ size_t dmx_receive(dmx_port_t dmx_num, dmx_packet_t *packet,
                    TickType_t wait_ticks);
 
 /**
+ * @brief Receives a specified number of DMX bytes and atomically copies a
+ * prefix of that same packet into a destination buffer.
+ *
+ * This combines the explicit receive-size contract of dmx_receive_num() with
+ * the coherent metadata/data retention of dmx_receive_snapshot(). It is useful
+ * when an application must re-arm a fixed expected packet length after a short
+ * packet without expanding the bounded prefix copied by the UART ISR.
+ *
+ * @param dmx_num The DMX port number.
+ * @param[out] packet Optional metadata for the retained packet.
+ * @param size Number of bytes to receive before the packet is complete.
+ * @param[out] destination Buffer that receives the retained packet prefix.
+ * @param snapshot_size Number of prefix bytes to copy, including start code.
+ * @param wait_ticks Number of ticks to wait before timeout.
+ * @return The retained packet size, or 0 if no packet was retained.
+ */
+size_t dmx_receive_num_snapshot(dmx_port_t dmx_num, dmx_packet_t *packet,
+                                size_t size, void *destination,
+                                size_t snapshot_size, TickType_t wait_ticks);
+
+/**
  * @brief Receives a DMX packet and atomically copies a prefix of that same
  * packet into a destination buffer.
  *

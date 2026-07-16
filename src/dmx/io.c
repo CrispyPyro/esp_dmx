@@ -366,9 +366,16 @@ size_t dmx_receive(dmx_port_t dmx_num, dmx_packet_t *packet,
   return dmx_receive_num(dmx_num, packet, size, wait_ticks);
 }
 
+size_t dmx_receive_num_snapshot(dmx_port_t dmx_num, dmx_packet_t *packet,
+                                size_t size, void *destination,
+                                size_t snapshot_size, TickType_t wait_ticks) {
+  return dmx_receive_num_internal(dmx_num, packet, size, destination,
+                                  snapshot_size, wait_ticks);
+}
+
 size_t dmx_receive_snapshot(dmx_port_t dmx_num, dmx_packet_t *packet,
-                            void *destination, size_t snapshot_size,
-                            TickType_t wait_ticks) {
+                             void *destination, size_t snapshot_size,
+                             TickType_t wait_ticks) {
   DMX_CHECK(dmx_num < DMX_NUM_MAX, 0, "dmx_num error");
   DMX_CHECK(dmx_driver_is_installed(dmx_num), 0, "driver is not installed");
   DMX_CHECK(dmx_driver_is_enabled(dmx_num), 0, "driver is not enabled");
@@ -378,7 +385,7 @@ size_t dmx_receive_snapshot(dmx_port_t dmx_num, dmx_packet_t *packet,
   size = dmx_driver[dmx_num]->dmx.size;
   taskEXIT_CRITICAL(DMX_SPINLOCK(dmx_num));
 
-  return dmx_receive_num_internal(dmx_num, packet, size, destination,
+  return dmx_receive_num_snapshot(dmx_num, packet, size, destination,
                                   snapshot_size, wait_ticks);
 }
 

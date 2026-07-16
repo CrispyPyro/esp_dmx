@@ -1,6 +1,6 @@
 # DMX Effector local patches
 
-_Created: 2026-07-15 PDT · Last updated: 2026-07-15 PDT_
+_Created: 2026-07-15 PDT · Last updated: 2026-07-16 PDT_
 
 This fork is the pinned `esp_dmx` dependency for DMX Effector. Local changes
 must remain reviewable here and the parent repository must advance its submodule
@@ -48,9 +48,9 @@ configured input window. Upstream `dmx_receive()` followed by `dmx_read()` does
 not make those two operations one frame-coherent transaction: the UART ISR may
 reuse the live receive buffer for the next frame before the task-side copy.
 
-The local `dmx_receive_snapshot()` API registers a bounded prefix request. At
-packet completion, or immediately before a short packet is reset by the next
-break, the ISR retains:
+The local snapshot APIs register a bounded prefix request. At packet
+completion, or immediately before a short packet is reset by the next break,
+the ISR retains:
 
 - the requested prefix;
 - packet error, start code, size, and RDM classification; and
@@ -63,11 +63,40 @@ buffer. Registration also closes the status-check/waiter-registration race by
 consuming a coherent snapshot that completed in that interval without waiting
 for a notification that could not yet be delivered.
 
+Two public entry points expose that retention:
+
+- `dmx_receive_snapshot()` preserves the original compatibility behavior: it
+  reads the driver's current (possibly learned) receive size, then requests an
+  atomic prefix snapshot at that size.
+- `dmx_receive_num_snapshot()` combines `dmx_receive_num()`'s explicit expected
+  length with the same atomic prefix/metadata retention. It lets a consumer
+  re-arm a fixed required length on every receive without increasing the prefix
+  copied by the ISR. The compatibility wrapper delegates to this entry point
+  after reading its learned size.
+
+The explicit-length form is required for short-to-long recovery. The UART ISR
+records the observed length when a break terminates a short packet. Reusing the
+learned-size wrapper on the next call can therefore keep later full frames
+completing at the old short length. DMX Effector now calls
+`dmx_receive_num_snapshot()` with its required prefix length on every receive:
+8 bytes in legacy mode, 14 bytes in canonical mode, or the reader's bounded
+configured prefix. A retained short packet remains `DMX_ERR_NOT_ENOUGH_SLOTS`,
+while the first later sufficiently long packet completes at the re-armed
+length.
+
+Callers must inspect `packet.err` rather than treating the size return as the
+sole received/not-received predicate. A coherently retained start-code-only
+short packet has retained size zero and `DMX_ERR_NOT_ENOUGH_SLOTS`; a timeout
+also returns zero but reports `DMX_ERR_TIMEOUT`. This distinction lets the
+application count the former as coherent raw-driver liveness while continuing
+to reject it as application input.
+
 The ISR copies only the requested prefix. Normal DMX Effector firmware requests
 8 bytes in legacy mode or 14 bytes in canonical mode; the diagnostic reader
 requests its configured logged prefix. The existing `dmx_receive()`,
-`dmx_receive_num()`, and asynchronous `dmx_read()` APIs are unchanged for other
-library consumers.
+`dmx_receive_num()`, asynchronous `dmx_read()`, and learned-size
+`dmx_receive_snapshot()` behavior remain compatible for other library
+consumers.
 
 The retained buffer is fixed storage in each installed driver object, adding
 approximately 0.5 KiB per port (including ports used only for TX). This avoids
@@ -75,9 +104,15 @@ ISR allocation and caller-buffer lifetime hazards; target builds and C3/S3 HIL
 must still confirm acceptable heap headroom and driver installation.
 
 `PIO_UNIT_TESTING` exposes `dmx_test_rx_snapshot_retention()` so the exact
-retention helper can be tested without UART hardware. Physical validation must
-still confirm that continuous full-universe input causes no RX errors, FIFO
-overruns, or restarts on both ESP32-C3 and ESP32-S3 targets.
+retention helper can be tested without UART hardware. Sustained alternating
+full-universe receive passed on ESP32-S3 with no mixed snapshots, FIFO overruns,
+or RX restarts. A later S3Gen1 HIL physically reproduced the learned-short-size
+lock, then confirmed the explicit-length fix: repeated retained short packets
+reported `DMX_ERR_NOT_ENOUGH_SLOTS` with no framing/overflow error or restart,
+and the first restored standard stream completed at 14 bytes and produced
+fresh application output without a driver restart or manual reset. ESP32-C3
+receive-path HIL remains deferred; the C3 is validated here only as the physical
+generator used by the S3 runs.
 
 ## Driver install/delete lifecycle fixes
 
