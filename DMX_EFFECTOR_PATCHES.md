@@ -157,6 +157,22 @@ source-verified; positive bench confirmation would log
 heap stays flat. The NULL-mutex path requires simulated heap exhaustion and is
 source-verified only.
 
+## Const-correct manufacturer-label registration
+
+`rdm_register_manufacturer_label()` took `char *` while `dmx_driver_install()`
+passes the string literal `RDM_MANUFACTURER_LABEL`, producing a
+`-Wdiscarded-qualifiers` warning on every build. The parameter is only ever
+read: the register path calls `strnlen()` and stores the pointer as a
+`DMX_PARAMETER_TYPE_STATIC` parameter whose RDM definition is GET-only
+(`.pid_cc = RDM_CC_GET`, no SET handler), so nothing can write through it.
+The signature now takes `const char *` (`src/rdm/responder/include/product_info.h`,
+`src/rdm/responder/product_info.c`), matching the sibling registration
+functions (`rdm_register_device_model_description()`,
+`rdm_register_device_label()`), with a commented cast at the
+`dmx_parameter_add()` call site whose `void *data` parameter serves both the
+copying and pointer-retaining paths. No behavior change; candidate for an
+upstream PR.
+
 ## Considered and deferred
 
 - **Skipping RDM parameter registration for non-RDM consumers.** The

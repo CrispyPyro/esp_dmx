@@ -149,7 +149,7 @@ size_t rdm_get_software_version_label(dmx_port_t dmx_num,
  * responses.
  */
 bool rdm_register_manufacturer_label(dmx_port_t dmx_num,
-                                     char *manufacturer_label,
+                                     const char *manufacturer_label,
                                      rdm_callback_t cb, void *context);
 
 /**

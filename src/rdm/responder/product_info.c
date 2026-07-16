@@ -259,7 +259,7 @@ size_t rdm_get_software_version_label(dmx_port_t dmx_num,
 }
 
 bool rdm_register_manufacturer_label(dmx_port_t dmx_num,
-                                     char *manufacturer_label,
+                                     const char *manufacturer_label,
                                      rdm_callback_t cb, void *context) {
   DMX_CHECK(dmx_num < DMX_NUM_MAX, false, "dmx_num error");
   DMX_CHECK(dmx_driver_is_installed(dmx_num), false, "driver is not installed");
@@ -273,10 +273,13 @@ bool rdm_register_manufacturer_label(dmx_port_t dmx_num,
 
   const rdm_pid_t pid = RDM_PID_MANUFACTURER_LABEL;
 
-  // Add the parameter as a static variable
+  // Add the parameter as a static variable. The STATIC type retains the
+  // caller's pointer, but this parameter is registered GET-only below, so the
+  // label is never written through this pointer and the cast is safe.
   const size_t size = strnlen(manufacturer_label, RDM_ASCII_SIZE_MAX);
   if (!dmx_parameter_add(dmx_num, RDM_SUB_DEVICE_ROOT, pid,
-                         DMX_PARAMETER_TYPE_STATIC, manufacturer_label, size)) {
+                         DMX_PARAMETER_TYPE_STATIC, (char *)manufacturer_label,
+                         size)) {
     return false;
   }
 
