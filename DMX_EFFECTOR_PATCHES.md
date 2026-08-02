@@ -1,7 +1,5 @@
 # DMX Effector local patches
 
-_Created: 2026-07-15 PDT · Last updated: 2026-07-16 PDT_
-
 This fork is the pinned `esp_dmx` dependency for DMX Effector. Local changes
 must remain reviewable here and the parent repository must advance its submodule
 gitlink to the resulting commit.
@@ -10,8 +8,7 @@ gitlink to the resulting commit.
 
 Upstream v4.1 predates ESP-IDF 5.3+ and did not run correctly against the
 pinned Arduino-ESP32 (IDF 5.x) toolchain, particularly for UART2 (the DMX
-Effector output port). Two early local commits (`ca44634e`, `f696e64d`, with a
-one-line correction in `e04d832d`) address this:
+Effector output port). The local patches address this as follows:
 
 - **UART init modernization** (`src/dmx/hal/uart.c`). On IDF 5.x the init uses
   the native `uart_param_config()` (with `ESP_ERROR_CHECK`) instead of
@@ -28,18 +25,12 @@ one-line correction in `e04d832d`) address this:
   interrupt source, and the port-2 context-array guards use `SOC_UART_NUM`
   (the chip's UART count) rather than `DMX_NUM_MAX`. Init also validates the
   UART number against `SOC_UART_NUM` and checks/logs the `esp_intr_alloc()`
-  result instead of ignoring it — the diagnostics that later exposed the
-  interrupt-input leak below.
+  result instead of ignoring it.
 - **Timer error-path hardening** (`src/dmx/hal/timer.c`). `dmx_timer_init()`
   returned `NULL` from a `bool` function on failure and ignored
   `gptimer_enable()` errors; it now returns `false`, deletes the gptimer on a
   failed enable, tracks a NULL handle, and `dmx_timer_deinit()` guards
   against deinitializing a never-created timer.
-
-The interim planning artifacts from this work (an IDF 5.5 modernization plan
-and an untested-changes scratch file, added in `e04d832d`) were removed again
-in `90f4e41f`/`f696e64d`; this tracker is the single authority for local
-divergence.
 
 ## Atomic receive-prefix snapshot
 
@@ -100,39 +91,31 @@ consumers.
 
 The retained buffer is fixed storage in each installed driver object, adding
 approximately 0.5 KiB per port (including ports used only for TX). This avoids
-ISR allocation and caller-buffer lifetime hazards; target builds and C3/S3 HIL
-must still confirm acceptable heap headroom and driver installation.
+ISR allocation and caller-buffer lifetime hazards; consumers must budget that
+fixed per-port heap cost when selecting how many drivers to install.
 
 `PIO_UNIT_TESTING` exposes `dmx_test_rx_snapshot_retention()` so the exact
-retention helper can be tested without UART hardware. Sustained alternating
-full-universe receive passed on ESP32-S3 with no mixed snapshots, FIFO overruns,
-or RX restarts. A later S3Gen1 HIL physically reproduced the learned-short-size
-lock, then confirmed the explicit-length fix: repeated retained short packets
-reported `DMX_ERR_NOT_ENOUGH_SLOTS` with no framing/overflow error or restart,
-and the first restored standard stream completed at 14 bytes and produced
-fresh application output without a driver restart or manual reset. ESP32-C3
-receive-path HIL remains deferred; the C3 is validated here only as the physical
-generator used by the S3 runs.
+retention helper can be exercised without UART hardware. DMX Effector's
+receive-path coverage also exercises alternating full-frame signatures and the
+short-to-long recovery contract described above.
 
 ## Driver install/delete lifecycle fixes
 
 DMX Effector reinstalls drivers routinely: the firmware's RX watchdog restarts
-the input driver on a silent line (settling at roughly one restart per minute
-while no console is connected) and the TX watchdog restarts the output driver
+the input driver on a silent line and the TX watchdog restarts the output driver
 on repeated incomplete sends. Upstream v4.1 assumes install happens once at
-boot, and repeated cycles exposed three lifecycle bugs, all fixed locally and
-all candidates for upstream PRs:
+boot, and repeated cycles exposed three lifecycle bugs:
 
 - **UART ISR interrupt-input leak** (`src/dmx/hal/uart.c`).
   `dmx_uart_deinit()` never freed the ISR handle allocated by
   `dmx_uart_init()`, leaking one interrupt input per install/uninstall cycle.
   The leak was introduced upstream in `e316ac99` ("add uart context", the 4.0
   HAL restructure), which dropped the `esp_intr_free()` that `361b16dc` had in
-  the 3.x driver-delete path. Hardware-confirmed on S3Gen4 with the camera
-  enabled: the second watchdog restart already failed with
-  `intr_alloc: No free interrupt inputs` (err=261), permanently red-blinking
-  the status LED. Deinit now frees the handle; init defensively frees a stale
-  handle before allocating. Both calls check the return value: a failed
+  the 3.x driver-delete path. Repeated restarts could therefore exhaust the
+  interrupt inputs, make installation fail with `intr_alloc: No free interrupt
+  inputs` (err=261), and leave the application in its input-failure indication.
+  Deinit now frees the handle; init defensively frees a stale handle before
+  allocating. Both calls check the return value: a failed
   `esp_intr_free()` (e.g. cross-core IPC failure) keeps the handle for a
   later retry instead of orphaning the live allocation, and init aborts so
   the install-retry backoff drives the retry.
@@ -145,17 +128,21 @@ all candidates for upstream PRs:
   overhead) leaked per install/delete cycle. Delete now frees every
   malloc-backed type; `STATIC` (caller-owned) and `NULL` remain untouched.
 - **NULL-mutex assert in delete** (`src/dmx/driver.c`).
-  When install's own mutex allocation fails it calls back into
-  `dmx_driver_delete()`, which took the NULL semaphore and hit a FreeRTOS
-  assert — turning heap exhaustion into a panic instead of a logged install
-  failure. Delete now takes and deletes the mutex only when it exists.
-
-Validation: the interrupt leak fix is hardware-confirmed on S3Gen4 (restarts
-proceed past #2 with no `intr_alloc` errors). The parameter-leak fix is
-source-verified; positive bench confirmation would log
-`esp_get_free_heap_size()` across a dozen forced restarts and confirm free
-heap stays flat. The NULL-mutex path requires simulated heap exhaustion and is
-source-verified only.
+  When install's own mutex allocation failed, the old path called the general
+  `dmx_driver_delete()` against a partially initialized object, took a NULL
+  semaphore, and hit a FreeRTOS assert. Merely skipping that semaphore was not
+  sufficient: the general delete path could still traverse uninitialized
+  parameter state, and install read `driver->mux` after delete freed `driver`.
+  The failure branch now clears the global slot and frees only the raw driver
+  allocation before returning the logged install failure. General deletion
+  remains reserved for objects that reached normal initialization.
+- **Lifecycle regression coverage** (`src/dmx/driver.c`, `src/dmx/include/driver.h`).
+  A `PIO_UNIT_TESTING`-only one-shot seam forces the next mutex allocation to
+  fail without exhausting the device heap; deployment builds contain neither
+  its state nor its control function. The DMX Effector lifecycle suite uses the
+  seam to check partial-install cleanup, heap integrity and capacity, and later
+  recovery, then checks the same heap properties across repeated real
+  install/delete cycles.
 
 ## Const-correct manufacturer-label registration
 
@@ -170,18 +157,5 @@ The signature now takes `const char *` (`src/rdm/responder/include/product_info.
 functions (`rdm_register_device_model_description()`,
 `rdm_register_device_label()`), with a commented cast at the
 `dmx_parameter_add()` call site whose `void *data` parameter serves both the
-copying and pointer-retaining paths. No behavior change; candidate for an
-upstream PR.
-
-## Considered and deferred
-
-- **Skipping RDM parameter registration for non-RDM consumers.** The
-  registrations are inert in this pinned version: `rdm_send_response()` is the
-  only path that transmits a response and neither the library's receive path
-  nor DMX Effector calls it, so the parameters cost only a small, bounded,
-  correctly-freed allocation per install. Bypassing registration would fork
-  `dmx_driver_install()` semantics for negligible gain; a compile-time
-  responder-strip seam belongs upstream. Caveat for future rebases: if a newer
-  esp_dmx auto-responds inside `dmx_receive()` (as 3.x-era designs did), the
-  DMX Effector input port (`tx=-1`, `en=-1`) cannot physically transmit a
-  response and this decision must be revisited.
+copying and pointer-retaining paths. The signature change does not alter runtime
+behavior.

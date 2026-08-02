@@ -353,6 +353,15 @@ size_t dmx_receive_snapshot(dmx_port_t dmx_num, dmx_packet_t *packet,
 
 #ifdef PIO_UNIT_TESTING
 /**
+ * @brief Forces the next driver mutex allocation to fail.
+ *
+ * This deterministic test seam is compiled only into PlatformIO unit-test
+ * images. It exercises the partial-install cleanup path without exhausting
+ * the device heap or affecting deployment builds.
+ */
+void dmx_test_force_next_mutex_allocation_failure(void);
+
+/**
  * @brief Test-only deterministic exercise of RX snapshot retention.
  *
  * Commits first_packet, attempts to commit second_packet before consumption,

@@ -53,6 +53,24 @@ const char *TAG = "dmx";  // The log tagline for the library.
 
 dmx_driver_t *dmx_driver[DMX_NUM_MAX] = {};  // The DMX drivers for each port.
 
+#ifdef PIO_UNIT_TESTING
+static bool test_fail_next_mutex_allocation = false;
+
+void dmx_test_force_next_mutex_allocation_failure(void) {
+  test_fail_next_mutex_allocation = true;
+}
+#endif
+
+static SemaphoreHandle_t dmx_driver_create_mutex(void) {
+#ifdef PIO_UNIT_TESTING
+  if (test_fail_next_mutex_allocation) {
+    test_fail_next_mutex_allocation = false;
+    return NULL;
+  }
+#endif
+  return xSemaphoreCreateRecursiveMutex();
+}
+
 static void rdm_default_identify_cb(dmx_port_t dmx_num, rdm_header_t *request,
                                     rdm_header_t *response, void *context) {
   if (request->cc == RDM_CC_SET_COMMAND &&
@@ -121,10 +139,15 @@ bool dmx_driver_install(dmx_port_t dmx_num, const dmx_config_t *config,
 #endif
 
   // Allocate mutex
-  driver->mux = xSemaphoreCreateRecursiveMutex();
+  driver->mux = dmx_driver_create_mutex();
   if (driver->mux == NULL) {
-    dmx_driver_delete(dmx_num);
-    DMX_CHECK(driver->mux != NULL, false, "DMX driver mutex malloc error");
+    // The general delete path expects the rest of the driver object to be
+    // initialized. At this point only the raw allocation and global slot
+    // exist, so release exactly those resources without traversing
+    // uninitialized device/parameter state or reading driver after free.
+    dmx_driver[dmx_num] = NULL;
+    heap_caps_free(driver);
+    DMX_CHECK(false, false, "DMX driver mutex malloc error");
   }
 
   // Driver configuration
@@ -263,9 +286,9 @@ bool dmx_driver_delete(dmx_port_t dmx_num) {
 
   dmx_driver_t *const driver = dmx_driver[dmx_num];
 
-  // Take the mutex. The mutex is NULL only when dmx_driver_install() calls
-  // back into this function after its own mutex allocation failed; there is
-  // nothing to take in that case, and taking a NULL semaphore would assert.
+  // Normal installation reaches this public cleanup path only after mutex
+  // allocation succeeds. Keep the NULL guard defensive so an unexpected
+  // partial state can be cleaned without turning recovery into an assert.
   SemaphoreHandle_t mux = driver->mux;
   if (mux != NULL && !xSemaphoreTakeRecursive(mux, 0)) {
     return false;
